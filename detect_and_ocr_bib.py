@@ -247,19 +247,16 @@ class Frame:
             image_roi, config=ocr_options, output_type=Output.DATAFRAME
         )
         df = df.dropna()
+        if df.empty:
+            return df
+        df = df[df['text'].str.contains('\d')]
+        if df.empty:
+            return df
         print(df['text'].values)
-        # text = df['text'].values[0]
-        # if df.empty :
-        #     continue
-        # if not str(text).replace(" ", ""):
-        #     continue
         df["x"] = x
         df["y"] = y
         df["w"] = w
         df["h"] = h
-        # plt.imshow(image_roi)
-        # plt.show()
-        # cv2.waitKey(0)
         return df
 
     def draw_ocr_result(self):
@@ -309,12 +306,18 @@ def main():
     # cv2.waitKey(0)
     frame = Frame(img_rgb, 640, 320)
     frame.locate_bib_candidates_east()
-    debug_imshow("Res image", frame.res_image)
-
+    # debug_imshow("Res image", frame.res_image)
+    plt.figure(figsize=(10,10))
+    plt.imshow(frame.res_image)
+    plt.show()
+    cv2.waitKey()
     frame.perform_ocr_for_bib_candidates()
         
     frame.draw_ocr_result()
-    debug_imshow("Res image", frame.res_image)
+    plt.figure(figsize=(10,10))
+    plt.imshow(frame.res_image)
+    plt.show()
+    cv2.waitKey()
 
 
 if __name__ == "__main__":
