@@ -1,3 +1,4 @@
+from cProfile import run
 from matplotlib import pyplot as plt
 import pytesseract
 from pytesseract import Output
@@ -42,7 +43,7 @@ def debug_imshow(
 def run_video():
     # Create a VideoCapture object and read from input file
     # If the input is the camera, pass 0 instead of the video file name
-    cap = cv2.VideoCapture(".\marathon_finish_10s.mp4")
+    cap = cv2.VideoCapture(".\data\marathon_finish_short_1.mp4")
 
     # Check if camera opened successfully
     if cap.isOpened() == False:
@@ -53,13 +54,12 @@ def run_video():
         ret, rgb = cap.read()
         rgb = rgb[600:, 200 : rgb.shape[1] - 200]
 
-        frame = Frame(rgb)
-        frame.locate_bib_candidates()
-        # frame.show_bib_candidates_contours()
+        frame = Frame(rgb, 640,320)
+        frame.locate_bib_candidates_east()
         frame.perform_ocr_for_bib_candidates()
-        result = frame.draw_ocr_result(rgb, frame.ocr_result_df)
+        frame.draw_ocr_result()
 
-        resized = cv2.resize(result, None, fx=0.4, fy=0.8, interpolation=cv2.INTER_AREA)
+        resized = cv2.resize(frame.res_image, None, fx=0.4, fy=0.8, interpolation=cv2.INTER_AREA)
 
         # Display the resulting frame
         cv2.imshow("Frame", resized)
@@ -123,36 +123,41 @@ def find_text(image, width, height, min_confidence=0.5):
         start_y = int(start_y * ratio_h) - 20
         end_x = int(end_x * ratio_w) + 20
         end_y = int(end_y * ratio_h) + 20
-        roi = (start_x , start_y, end_x - start_x , end_y - start_y)
+        roi = (start_x, start_y, end_x - start_x, end_y - start_y)
         rois.append(roi)
         cv2.rectangle(orig_image, (start_x, start_y), (end_x, end_y), (255, 0, 0), 2)
 
     return rois, orig_image
 
-
+def clean_string(val):
+    return "".join([c if 48 < ord(c) < 57 else "" for c in str(val)])
+    
 class Frame:
-    def __init__(self, rgb_image, width, height) -> None:
+    def __init__(self, rgb_image, width, height, multiprocess=False, psm=3) -> None:
         self.rgb = rgb_image
         self.res_image = rgb_image.copy()
-        self.morphed = self.morphology(rgb_image)
-        self.ocr_options = self.build_tesseract_options(psm=1)
-        # resizing image
+        self.ocr_options = self.build_tesseract_options(psm)
         self.resized, self.ratio_w, self.ratio_h = resize_image(self.rgb, width, height)
         self.detector = "frozen_east_text_detection.pb"
-
-
-    def morphology(self, image_rgb):
+        self.multiprocess = multiprocess
+        
+    def compute_mask(self):
         threshold = 100
-        threshed = (image_rgb > threshold).all(axis=2)
+        threshed = (self.resized > threshold).all(axis=2)
         threshed = threshed * np.uint8(255)
-        threshed_2 = threshed[..., np.newaxis]
-        eroded = cv2.morphologyEx(threshed_2, cv2.MORPH_ERODE, (10, 10), iterations=10)
+        eroded = cv2.morphologyEx(threshed, cv2.MORPH_ERODE, (10, 10), iterations=10)
         border = 100
         eroded[:border, :] = 0
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1))
-        return cv2.morphologyEx(eroded, op=cv2.MORPH_CLOSE, kernel=kernel, iterations=2)
+        mask =  cv2.morphologyEx(eroded, op=cv2.MORPH_CLOSE, kernel=kernel, iterations=2)
 
-    def locate_bib_candidates_east(self, min_confidence=0.5):
+        gray = cv2.cvtColor(self.resized, cv2.COLOR_RGB2GRAY)
+        threshed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        self.img_masked = np.bitwise_and(threshed, mask)
+        debug_imshow("image masked", self.img_masked)
+        
+
+    def locate_bib_candidates_east(self, min_confidence=0.8):
 
         # layers used for ROI recognition
         layer_names = ["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"]
@@ -160,27 +165,36 @@ class Frame:
         # pre-loading the frozen graph
         print("[INFO] loading the detector...")
         net = cv2.dnn.readNet(self.detector)
-
+        
+        # self.compute_mask()
+        # masked_img_rgb = cv2.cvtColor(self.img_masked, cv2.COLOR_GRAY2RGB)
         # getting results from the model
         scores, geometry = forward_passer(net, self.resized, layers=layer_names)
 
         # decoding results from the model
         rectangles, confidences = box_extractor(scores, geometry, min_confidence)
+        
+        rectangles = np.array(rectangles)
+        confidences = np.array(confidences)
+        max_rect = 10
+        inds = confidences.argsort()[::-1][:max_rect]
+        rectangles = rectangles[inds]
+        confidences = confidences[inds]
 
         # applying non-max suppression to get boxes depicting text regions
-        boxes = non_max_suppression(np.array(rectangles), probs=confidences)
+        boxes = non_max_suppression(rectangles, probs=confidences)
         rois = []
+        
+        extension = 0
         for (start_x, start_y, end_x, end_y) in boxes:
-            start_x = int(start_x * self.ratio_w) - 20
-            start_y = int(start_y * self.ratio_h) - 20
-            end_x = int(end_x * self.ratio_w) + 20
-            end_y = int(end_y * self.ratio_h) + 20
-            roi = (start_x , start_y, end_x - start_x , end_y - start_y)
+            start_x = int(start_x * self.ratio_w) - extension
+            start_y = int(start_y * self.ratio_h) - extension
+            end_x = int(end_x * self.ratio_w) + extension
+            end_y = int(end_y * self.ratio_h) + extension
+            roi = (start_x, start_y, end_x - start_x, end_y - start_y)
             rois.append(roi)
             cv2.rectangle(self.res_image, (start_x, start_y), (end_x, end_y), (0, 0, 255), 2)
-
         self.bib_candidates_rois = rois
-
 
     def locate_bib_candidates(self, keep=5):
         cnts = cv2.findContours(self.morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -219,21 +233,22 @@ class Frame:
         return options
 
     @timeit
-    def perform_ocr_for_bib_candidates(self, multiprocess=False):
-        if multiprocess:
+    def perform_ocr_for_bib_candidates(self):
+        if self.multiprocess:
             rgb_and_rois = [
                 (self.rgb[y : y + h, x : x + w], (x, y, w, h))
                 for x, y, w, h in self.bib_candidates_rois
             ]
             pool = ThreadPool(nodes=8)
             df_list = list(pool.imap(self.perform_ocr, rgb_and_rois))
-        else :
+        else:
             df_list = []
             for x, y, w, h in self.bib_candidates_rois:
                 df = self.perform_ocr((self.rgb[y : y + h, x : x + w], (x, y, w, h)))
                 df_list.append(df)
-            
+
         self.ocr_result_df = pd.concat(df_list)
+
     @staticmethod
     @timeit
     def perform_ocr(rgb_and_roi):
@@ -243,16 +258,16 @@ class Frame:
         # gray_roi = cv2.cvtColor(image_roi, cv2.COLOR_RGB2GRAY)
         # threshed_roi = cv2.threshold(gray_roi, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
         ocr_options = Frame.build_tesseract_options(psm=3)
-        df = pytesseract.image_to_data(
-            image_roi, config=ocr_options, output_type=Output.DATAFRAME
-        )
+        df = pytesseract.image_to_data(image_roi, config=ocr_options, output_type=Output.DATAFRAME)
         df = df.dropna()
         if df.empty:
             return df
-        df = df[df['text'].str.contains('\d')]
+        df['text'] = df['text'].apply(clean_string)
+        df['text'] = pd.to_numeric(df.text, errors='coerce')
+        df = df.dropna()
         if df.empty:
             return df
-        print(df['text'].values)
+        print(df["text"].values)
         df["x"] = x
         df["y"] = y
         df["w"] = w
@@ -261,7 +276,7 @@ class Frame:
 
     def draw_ocr_result(self):
         for index, row in self.ocr_result_df.iterrows():
-            try :
+            try:
                 num = int(row["text"])
             except ValueError:
                 continue
@@ -288,15 +303,14 @@ class Frame:
 
 
 # TODO :
-# Use multiprocessing to perform ocr
-#  fix possible whites spaces and options min charac
-#  fix take letter per letter and take the 5 most confident letters
+# filter box after east detection, could be done on multiprocessing
+# Use EAST on threshed ?
 # Use EAST text detector on black hat ?
 
 debug = True
 
 
-def main():
+def ocr_snapshot():
 
     img_rgb = io.imread(".\data\snapshot.jpeg")
     # img_rgb = cv2.imread(".\data\snapshot.jpeg", cv2.IMREAD_UNCHANGED)
@@ -304,22 +318,26 @@ def main():
     # _,detection = find_text(img_rgb, 640, 320, 0.999)
     # cv2.imshow("res", detection)
     # cv2.waitKey(0)
-    frame = Frame(img_rgb, 640, 320)
+    frame = Frame(img_rgb, 640, 320, multiprocess=False)
     frame.locate_bib_candidates_east()
     # debug_imshow("Res image", frame.res_image)
-    plt.figure(figsize=(10,10))
+    plt.figure(figsize=(10, 10))
     plt.imshow(frame.res_image)
     plt.show()
     cv2.waitKey()
     frame.perform_ocr_for_bib_candidates()
-        
+
     frame.draw_ocr_result()
-    plt.figure(figsize=(10,10))
+    plt.figure(figsize=(10, 10))
     plt.imshow(frame.res_image)
     plt.show()
     cv2.waitKey()
 
 
+def main():
+    # ocr_snapshot()
+    run_video()
+
+
 if __name__ == "__main__":
     main()
-    # run_video()
