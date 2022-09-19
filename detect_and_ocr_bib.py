@@ -1,4 +1,5 @@
 from cProfile import run
+from email.mime import image
 from matplotlib import pyplot as plt
 import pytesseract
 from pytesseract import Output
@@ -49,31 +50,47 @@ def run_video():
     if cap.isOpened() == False:
         print("Error opening video stream or file")
     # Read until video is completed
+    image_list = []
+    i = 0
     while cap.isOpened():
+        i = i+1
+        if i> 400 :
+            break
+        if i%2==0:
+            continue
         # Capture frame-by-frame
         ret, rgb = cap.read()
-        rgb = rgb[600:, 200 : rgb.shape[1] - 200]
+        if not ret:
+            break
+        rgb = rgb[600:, 20 : rgb.shape[1] - 20]
 
-        frame = Frame(rgb, 640,320)
+        frame = Frame(rgb, 640,320, multiprocess=True)
         frame.locate_bib_candidates_east()
         frame.perform_ocr_for_bib_candidates()
         frame.draw_ocr_result()
 
-        resized = cv2.resize(frame.res_image, None, fx=0.4, fy=0.8, interpolation=cv2.INTER_AREA)
+        # resized = cv2.resize(frame.res_image, None, fx=0.4, fy=0.8, interpolation=cv2.INTER_AREA)
 
         # Display the resulting frame
-        cv2.imshow("Frame", resized)
+        # cv2.imshow("Frame", resized)
 
         # Press Q on keyboard to  exit
-        if cv2.waitKey(25) & 0xFF == ord("q"):
-            break
+        # if cv2.waitKey(25) & 0xFF == ord("q"):
+            # break
 
+        image_list.append(frame.res_image)
     # When everything done, release the video capture object
     cap.release()
 
     # Closes all the frames
     cv2.destroyAllWindows()
-
+    height, width, _ = image_list[0].shape
+    size = (width,height)
+    fps = 5
+    video = cv2.VideoWriter('.\data\marathon_ocr.avi',cv2.VideoWriter_fourcc(*'DIVX'), fps, size)
+    
+    for image in image_list:
+        video.write(image)
 
 def resize_image(image, width, height):
     """
@@ -94,7 +111,6 @@ def resize_image(image, width, height):
 
 
 def find_text(image, width, height, min_confidence=0.5):
-    detector = "frozen_east_text_detection.pb"
 
     # reading in image
     orig_image = image.copy()
@@ -105,12 +121,8 @@ def find_text(image, width, height, min_confidence=0.5):
     # layers used for ROI recognition
     layer_names = ["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"]
 
-    # pre-loading the frozen graph
-    print("[INFO] loading the detector...")
-    net = cv2.dnn.readNet(detector)
-
     # getting results from the model
-    scores, geometry = forward_passer(net, image, layers=layer_names)
+    scores, geometry = forward_passer(NETWORK, image, layers=layer_names)
 
     # decoding results from the model
     rectangles, confidences = box_extractor(scores, geometry, min_confidence)
@@ -138,38 +150,36 @@ class Frame:
         self.res_image = rgb_image.copy()
         self.ocr_options = self.build_tesseract_options(psm)
         self.resized, self.ratio_w, self.ratio_h = resize_image(self.rgb, width, height)
-        self.detector = "frozen_east_text_detection.pb"
+        self.masked_rgb = self.compute_mask()
         self.multiprocess = multiprocess
         
     def compute_mask(self):
-        threshold = 100
-        threshed = (self.resized > threshold).all(axis=2)
-        threshed = threshed * np.uint8(255)
-        eroded = cv2.morphologyEx(threshed, cv2.MORPH_ERODE, (10, 10), iterations=10)
-        border = 100
-        eroded[:border, :] = 0
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1))
-        mask =  cv2.morphologyEx(eroded, op=cv2.MORPH_CLOSE, kernel=kernel, iterations=2)
-
+        threshold = 150
+        threshed_morph = (self.resized > threshold).all(axis=2)
+        threshed_morph = threshed_morph * np.uint8(255)
+        # self.img_masked = threshed
+        # border = 100
+        # eroded[:border, :] = 0
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        eroded = cv2.morphologyEx(threshed_morph, cv2.MORPH_ERODE, kernel, iterations=1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 5))
+        mask =  cv2.morphologyEx(eroded, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # threshed_inv = np.bitwise_not(threshed)
+        # self.img_masked = np.bitwise_and(threshed_inv, mask)
         gray = cv2.cvtColor(self.resized, cv2.COLOR_RGB2GRAY)
-        threshed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
-        self.img_masked = np.bitwise_and(threshed, mask)
-        debug_imshow("image masked", self.img_masked)
+        threshed_text = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU )[1]
+        self.img_masked = threshed_text
         
-
+    @timeit
     def locate_bib_candidates_east(self, min_confidence=0.8):
 
         # layers used for ROI recognition
         layer_names = ["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"]
 
-        # pre-loading the frozen graph
-        print("[INFO] loading the detector...")
-        net = cv2.dnn.readNet(self.detector)
-        
         # self.compute_mask()
         # masked_img_rgb = cv2.cvtColor(self.img_masked, cv2.COLOR_GRAY2RGB)
         # getting results from the model
-        scores, geometry = forward_passer(net, self.resized, layers=layer_names)
+        scores, geometry = forward_passer(NETWORK, self.resized, layers=layer_names)
 
         # decoding results from the model
         rectangles, confidences = box_extractor(scores, geometry, min_confidence)
@@ -250,13 +260,13 @@ class Frame:
         self.ocr_result_df = pd.concat(df_list)
 
     @staticmethod
-    @timeit
     def perform_ocr(rgb_and_roi):
         image_roi, roi = rgb_and_roi
         x, y, w, h = roi
 
         # gray_roi = cv2.cvtColor(image_roi, cv2.COLOR_RGB2GRAY)
         # threshed_roi = cv2.threshold(gray_roi, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        # todo test if can be moved outside with multiprocessing
         ocr_options = Frame.build_tesseract_options(psm=3)
         df = pytesseract.image_to_data(image_roi, config=ocr_options, output_type=Output.DATAFRAME)
         df = df.dropna()
@@ -280,9 +290,10 @@ class Frame:
                 num = int(row["text"])
             except ValueError:
                 continue
-            # if  num < 10_000 or num > 100_000:
-            #     continue
-            text = str(num)
+            if num < 10_000 :
+                continue
+            # Take the first 5 digits
+            text = str(num[:5])
             x = int(row["x"])
             y = int(row["y"])
             w = int(row["w"])
@@ -319,19 +330,22 @@ def ocr_snapshot():
     # cv2.imshow("res", detection)
     # cv2.waitKey(0)
     frame = Frame(img_rgb, 640, 320, multiprocess=False)
-    frame.locate_bib_candidates_east()
-    # debug_imshow("Res image", frame.res_image)
+    frame.compute_mask()
+    # frame.locate_bib_candidates_east()
     plt.figure(figsize=(10, 10))
-    plt.imshow(frame.res_image)
+    plt.imshow(frame.img_masked, cmap='gray')
     plt.show()
     cv2.waitKey()
-    frame.perform_ocr_for_bib_candidates()
+    # frame.perform_ocr_for_bib_candidates()
 
-    frame.draw_ocr_result()
-    plt.figure(figsize=(10, 10))
-    plt.imshow(frame.res_image)
-    plt.show()
-    cv2.waitKey()
+    # frame.draw_ocr_result()
+    # plt.figure(figsize=(10, 10))
+    # plt.imshow(frame.res_image)
+    # plt.show()
+    # cv2.waitKey()
+
+detector = "frozen_east_text_detection.pb"
+NETWORK = cv2.dnn.readNet(detector)
 
 
 def main():
