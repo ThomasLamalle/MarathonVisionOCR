@@ -16,7 +16,7 @@ import time
 import numpy as np
 
 
-def forward_passer(net, image, layers, timing=True):
+def forward_passer(net, image, layers, timing=False):
     """
     Returns results from a single pass on a Deep Neural Net for a given list of layers
     :param net: Deep Neural Net (usually a pre-loaded .pb file)
